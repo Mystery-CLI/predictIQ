@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::ValidateEmail;
 
-use crate::{blockchain::HealthStatus, cache::keys, db::DbError, email::webhook::sendgrid_webhook_handler, pagination::{PaginatedResponse, PaginationQuery}, AppState};
+use crate::{blockchain::HealthStatus, cache::{keys, InvalidationTag}, db::DbError, email::webhook::sendgrid_webhook_handler, pagination::{PaginatedResponse, PaginationQuery}, AppState};
 
 #[derive(Debug, Serialize)]
 pub struct ApiError {
@@ -730,25 +730,13 @@ pub async fn resolve_market(
         .await
         .map_err(map_err)?;
 
-    // 2. Invalidate only the keys affected by this market's resolution.
-    //    Broad prefix wildcards (api:v1:* / dbq:v1:*) are intentionally avoided
-    //    to keep the blast radius small.
-    let network = state.config.network_name();
-    let featured_limit = state.config.featured_limit;
-    let keys_to_del = [
-        keys::chain_market(market_id),
-        keys::chain_oracle_result(network, market_id),
-        keys::api_statistics(),
-        keys::api_featured_markets(),
-        keys::dbq_statistics(),
-        keys::dbq_featured_markets(featured_limit),
-    ];
-
-    let mut invalidated = 0usize;
-    for key in &keys_to_del {
-        state.cache.del(key).await.map_err(map_err)?;
-        invalidated += 1;
-    }
+    // 2. Invalidate only the keys affected by this market's resolution via tag.
+    let tag = InvalidationTag::MarketResolved {
+        market_id,
+        network: state.config.network_name().to_owned(),
+        featured_limit: state.config.featured_limit,
+    };
+    let invalidated = state.cache.invalidate_tag(&tag).await.map_err(map_err)?;
 
     state
         .metrics

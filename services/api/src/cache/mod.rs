@@ -395,10 +395,27 @@ impl RedisCache {
         let start = std::time::Instant::now();
         let value = fetcher().await?;
         // Best-effort write — don't fail the request if cache write fails.
-        if let Err(e) = self.set_json(key, &value, ttl).await {
-            tracing::warn!(key, error = %e, "cache write failed");
+        if let Err(e) = self.set_json(entry_key, &value, ttl).await {
+            tracing::warn!(entry_key, error = %e, "cache write failed");
         }
         Ok((value, false))
+    }
+
+    /// Invalidate all cache keys associated with `tag`.
+    ///
+    /// Keys are derived from the tag at call time — no Redis set membership
+    /// lookup is required, keeping the blast radius deterministic and bounded.
+    /// Returns the number of keys deleted (keys that were already absent count
+    /// as 0 from Redis DEL but are still included in the returned count for
+    /// observability purposes).
+    pub async fn invalidate_tag(&self, tag: &InvalidationTag) -> anyhow::Result<usize> {
+        let tag_keys = tag.cache_keys();
+        let mut deleted = 0usize;
+        for key in &tag_keys {
+            self.del(key).await?;
+            deleted += 1;
+        }
+        Ok(deleted)
     }
 }
 
@@ -536,6 +553,87 @@ mod tests {
         assert_eq!(deleted, 0);
     }
 
+    // ── InvalidationTag tests ────────────────────────────────────────────────
+
+    /// Verifies that MarketResolved tag produces exactly the expected 6 keys.
+    #[test]
+    fn market_resolved_tag_produces_correct_keys() {
+        use super::InvalidationTag;
+        let tag = InvalidationTag::MarketResolved {
+            market_id: 7,
+            network: "testnet".to_string(),
+            featured_limit: 10,
+        };
+        let keys = tag.cache_keys();
+        assert_eq!(keys.len(), 6, "MarketResolved must cover exactly 6 keys");
+        assert!(keys.contains(&"chain:v1:market:7".to_string()));
+        assert!(keys.contains(&"chain:v1:oracle:testnet:market:7".to_string()));
+        assert!(keys.contains(&"api:v1:statistics".to_string()));
+        assert!(keys.contains(&"api:v1:featured_markets".to_string()));
+        assert!(keys.contains(&"dbq:v1:statistics".to_string()));
+        assert!(keys.contains(&"dbq:v1:featured_markets:limit:10".to_string()));
+    }
+
+    /// Verifies that different market IDs produce distinct key sets (no cross-contamination).
+    #[test]
+    fn market_resolved_tag_keys_are_market_id_scoped() {
+        use super::InvalidationTag;
+        let keys_a = InvalidationTag::MarketResolved {
+            market_id: 1,
+            network: "mainnet".to_string(),
+            featured_limit: 5,
+        }
+        .cache_keys();
+        let keys_b = InvalidationTag::MarketResolved {
+            market_id: 2,
+            network: "mainnet".to_string(),
+            featured_limit: 5,
+        }
+        .cache_keys();
+
+        // Per-market keys must differ.
+        assert_ne!(
+            keys_a.iter().find(|k| k.contains("chain:v1:market:")),
+            keys_b.iter().find(|k| k.contains("chain:v1:market:")),
+        );
+        // Aggregate keys are shared (both markets affect statistics).
+        assert_eq!(
+            keys_a.iter().find(|k| k.as_str() == "api:v1:statistics"),
+            keys_b.iter().find(|k| k.as_str() == "api:v1:statistics"),
+        );
+    }
+
+    /// Integration: invalidate_tag deletes exactly the keys in the tag and leaves others.
+    #[tokio::test]
+    async fn invalidate_tag_deletes_tag_keys_only() {
+        use super::InvalidationTag;
+        let (cache, _c) = start_cache().await;
+
+        let tag = InvalidationTag::MarketResolved {
+            market_id: 99,
+            network: "testnet".to_string(),
+            featured_limit: 10,
+        };
+
+        // Populate all tag keys plus one unrelated key.
+        for key in tag.cache_keys() {
+            cache.set_json(&key, &1u32, Duration::from_secs(60)).await.unwrap();
+        }
+        cache.set_json("unrelated:key", &42u32, Duration::from_secs(60)).await.unwrap();
+
+        let deleted = cache.invalidate_tag(&tag).await.unwrap();
+        assert_eq!(deleted, 6, "must report 6 deletions");
+
+        // All tag keys must be gone.
+        for key in tag.cache_keys() {
+            let v: Option<u32> = cache.get_json(&key).await.unwrap();
+            assert!(v.is_none(), "{key} must be absent after invalidate_tag");
+        }
+        // Unrelated key must survive.
+        let survivor: Option<u32> = cache.get_json("unrelated:key").await.unwrap();
+        assert_eq!(survivor, Some(42));
+    }
+
     #[tokio::test]
     async fn circuit_breaker_degrades_gracefully() {
         use super::{CircuitState, RedisCacheConfig};
@@ -568,6 +666,65 @@ mod tests {
             .unwrap();
         assert_eq!(val, 7);
         assert!(!hit);
+    }
+}
+
+// ── Invalidation tags ────────────────────────────────────────────────────────
+//
+// # Key and tag strategy
+//
+// Every cache key belongs to exactly one *invalidation tag*. A tag groups the
+// minimal set of keys that must be evicted together when a specific write
+// occurs. This keeps the blast radius deterministic: callers declare *what
+// changed* (the tag) rather than *which keys to delete* (the key list).
+//
+// ## Tag → key mapping
+//
+// | Tag                          | Keys invalidated                                                  |
+// |------------------------------|-------------------------------------------------------------------|
+// | `MarketResolved(id, net, lim)` | chain_market(id), chain_oracle_result(net,id),                  |
+// |                              | api_statistics, api_featured_markets,                             |
+// |                              | dbq_statistics, dbq_featured_markets(lim)                         |
+//
+// ## Rules
+// - Tags are defined here; handlers import and use them.
+// - A tag must never include keys from unrelated domains (e.g. resolving a
+//   market must not evict content or user-bet keys).
+// - When a new write path is added, add a corresponding tag here first.
+
+/// Describes a write event and the exact cache keys it invalidates.
+///
+/// Use [`RedisCache::invalidate_tag`] to apply a tag.
+#[derive(Debug, Clone)]
+pub enum InvalidationTag {
+    /// A market was resolved.
+    ///
+    /// Invalidates the per-market chain entry, the oracle result, and the
+    /// aggregate statistics / featured-markets lists.
+    MarketResolved {
+        market_id: i64,
+        network: String,
+        featured_limit: i64,
+    },
+}
+
+impl InvalidationTag {
+    /// Returns the exact set of cache keys this tag covers.
+    pub fn cache_keys(&self) -> Vec<String> {
+        match self {
+            InvalidationTag::MarketResolved {
+                market_id,
+                network,
+                featured_limit,
+            } => vec![
+                keys::chain_market(*market_id),
+                keys::chain_oracle_result(network, *market_id),
+                keys::api_statistics(),
+                keys::api_featured_markets(),
+                keys::dbq_statistics(),
+                keys::dbq_featured_markets(*featured_limit),
+            ],
+        }
     }
 }
 
