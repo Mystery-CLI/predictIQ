@@ -53,4 +53,5 @@ pub enum ErrorCode {
     GovernanceTokenNotSet = 146,
     MarketNotResolved = 147,
     InvalidDeadline = 148,
+    ResolutionDeadlinePassed = 149,
 }
