@@ -98,16 +98,36 @@ impl Database {
         self.pool.clone()
     }
 
+    /// Snapshot pool size/idle into Prometheus gauges.
+    /// Call this just before rendering `/metrics` so the values are current.
+    pub fn record_pool_metrics(&self) {
+        self.metrics.record_pool_metrics(self.pool.size(), self.pool.num_idle());
+    }
+
     pub async fn new(
         database_url: &str,
         cache: RedisCache,
         metrics: Metrics,
         pool_config: &crate::config::DbPoolConfig,
     ) -> anyhow::Result<Self> {
+        let stmt_timeout_ms = pool_config.statement_timeout_ms;
+        let lock_timeout_ms = pool_config.lock_timeout_ms;
+
         let mut builder = PgPoolOptions::new()
             .max_connections(pool_config.max_connections)
             .min_connections(pool_config.min_connections)
-            .acquire_timeout(pool_config.acquire_timeout);
+            .acquire_timeout(pool_config.acquire_timeout)
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query(&format!("SET statement_timeout = {stmt_timeout_ms}"))
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query(&format!("SET lock_timeout = {lock_timeout_ms}"))
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            });
 
         if let Some(idle) = pool_config.idle_timeout {
             builder = builder.idle_timeout(idle);

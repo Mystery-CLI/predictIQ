@@ -33,6 +33,7 @@ pub struct BlockchainClient {
     cache: RedisCache,
     metrics: Metrics,
     monitor: Arc<MonitoringState>,
+    expected_passphrase: String,
 }
 
 /// TTL for watched transaction hashes. Entries older than this are evicted
@@ -170,6 +171,18 @@ struct RpcError {
     message: String,
 }
 
+/// Standard JSON-RPC error codes that indicate a client-side mistake and
+/// should never be retried (retrying will produce the same error).
+fn is_non_retryable_rpc_error(code: i64) -> bool {
+    matches!(
+        code,
+        -32700  // Parse error
+        | -32600  // Invalid request
+        | -32601  // Method not found
+        | -32602  // Invalid params
+    )
+}
+
 impl BlockchainClient {
     pub fn new(config: &Config, cache: RedisCache, metrics: Metrics) -> anyhow::Result<Self> {
         let http = Client::builder()
@@ -218,7 +231,48 @@ impl BlockchainClient {
             cache,
             metrics,
             monitor: Arc::new(MonitoringState::default()),
+            expected_passphrase: config.network_passphrase.clone(),
         })
+    }
+
+    /// Query the RPC node for its network passphrase and verify it matches
+    /// the configured `STELLAR_NETWORK_PASSPHRASE`. Startup must call this and
+    /// fail fast if the passphrase does not match, preventing silently signed
+    /// transactions for the wrong network.
+    ///
+    /// When `STELLAR_NETWORK_PASSPHRASE` is unset (empty string, e.g. for a
+    /// custom network without a known passphrase), validation is skipped.
+    pub async fn validate_network_passphrase(&self) -> anyhow::Result<()> {
+        if self.expected_passphrase.is_empty() {
+            tracing::info!("STELLAR_NETWORK_PASSPHRASE not set; skipping passphrase validation");
+            return Ok(());
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct NetworkResult {
+            passphrase: String,
+        }
+
+        let result: NetworkResult = self
+            .rpc_call("getNetwork", serde_json::json!({}))
+            .await
+            .context("failed to query RPC network info for passphrase validation")?;
+
+        if result.passphrase != self.expected_passphrase {
+            anyhow::bail!(
+                "Stellar network passphrase mismatch — \
+                 RPC returned {:?} but STELLAR_NETWORK_PASSPHRASE is {:?}. \
+                 Check BLOCKCHAIN_NETWORK and STELLAR_NETWORK_PASSPHRASE.",
+                result.passphrase,
+                self.expected_passphrase,
+            );
+        }
+
+        tracing::info!(
+            passphrase = %result.passphrase,
+            "Stellar network passphrase validated"
+        );
+        Ok(())
     }
 
     async fn rpc_call<T: for<'de> Deserialize<'de>>(
@@ -242,37 +296,73 @@ impl BlockchainClient {
 
             match response {
                 Ok(resp) => {
-                    let parsed = resp
-                        .error_for_status()
-                        .context("rpc status error")?
-                        .json::<RpcEnvelope<T>>()
-                        .await
-                        .context("rpc parse error")?;
+                    let status = resp.status();
 
-                    if let Some(err) = parsed.error {
+                    // 4xx (except 429 Too Many Requests) are non-retryable client errors.
+                    if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        return Err(anyhow!(
+                            "rpc {} non-retryable client error: {}",
+                            method, status
+                        ));
+                    }
+
+                    if !status.is_success() {
+                        // 5xx / 429 are transient — retry with backoff.
                         if attempt >= self.retry_attempts {
                             return Err(anyhow!(
-                                "rpc {} failed: {} ({})",
-                                method,
-                                err.message,
-                                err.code
+                                "rpc {} http error after {} attempt(s): {}",
+                                method, attempt, status
                             ));
                         }
-                    } else if let Some(result) = parsed.result {
-                        return Ok(result);
-                    } else if attempt >= self.retry_attempts {
-                        return Err(anyhow!("rpc {} returned empty result", method));
+                        tracing::warn!(
+                            method, attempt, %status,
+                            "rpc http error, retrying"
+                        );
+                    } else {
+                        let parsed = resp
+                            .json::<RpcEnvelope<T>>()
+                            .await
+                            .context("rpc parse error")?;
+
+                        if let Some(err) = parsed.error {
+                            if is_non_retryable_rpc_error(err.code) {
+                                return Err(anyhow!(
+                                    "rpc {} non-retryable error: {} ({})",
+                                    method, err.message, err.code
+                                ));
+                            }
+                            if attempt >= self.retry_attempts {
+                                return Err(anyhow!(
+                                    "rpc {} failed: {} ({})",
+                                    method, err.message, err.code
+                                ));
+                            }
+                            tracing::warn!(
+                                method, attempt, code = err.code,
+                                message = %err.message, "rpc error, retrying"
+                            );
+                        } else if let Some(result) = parsed.result {
+                            return Ok(result);
+                        } else if attempt >= self.retry_attempts {
+                            return Err(anyhow!("rpc {} returned empty result", method));
+                        } else {
+                            tracing::warn!(method, attempt, "rpc empty result, retrying");
+                        }
                     }
                 }
                 Err(err) => {
                     if attempt >= self.retry_attempts {
                         return Err(anyhow!("rpc {} transport failed: {err}", method));
                     }
+                    tracing::warn!(method, attempt, error = %err, "rpc transport error, retrying");
                 }
             }
 
-            let backoff = self.retry_base_delay_ms * u64::from(attempt);
-            sleep(Duration::from_millis(backoff)).await;
+            // Exponential backoff: base_delay * 2^(attempt-1), capped at 60 s.
+            let backoff_ms = (self.retry_base_delay_ms * (1u64 << (attempt - 1).min(10)))
+                .min(60_000);
+            tracing::warn!(method, attempt, backoff_ms, "rpc retry scheduled");
+            sleep(Duration::from_millis(backoff_ms)).await;
         }
     }
 

@@ -142,6 +142,13 @@ pub struct DbPoolConfig {
     /// Per-query execution timeout. Queries that exceed this are cancelled and
     /// return an error. Configured via `DB_QUERY_TIMEOUT_SECS` (default: 30).
     pub query_timeout: Duration,
+    /// PostgreSQL `statement_timeout` set on every connection via `after_connect`.
+    /// Prevents runaway queries from holding connections indefinitely.
+    /// Configured via `DB_STATEMENT_TIMEOUT_MS` (default: 30000 ms).
+    pub statement_timeout_ms: u64,
+    /// PostgreSQL `lock_timeout` set on every connection via `after_connect`.
+    /// Prevents lock-contention hangs. Configured via `DB_LOCK_TIMEOUT_MS` (default: 10000 ms).
+    pub lock_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +221,10 @@ pub struct Config {
     /// Contract storage key schema.  See [`ContractKeySchema`] for per-field
     /// documentation and startup validation.
     pub contract_key_schema: ContractKeySchema,
+    /// Expected Stellar network passphrase. Validated against the RPC node at
+    /// startup. Configured via `STELLAR_NETWORK_PASSPHRASE`; defaults to the
+    /// canonical passphrase for the configured `BLOCKCHAIN_NETWORK`.
+    pub network_passphrase: String,
 }
 
 impl Config {
@@ -282,6 +293,15 @@ impl Config {
             .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
             .unwrap_or_else(|_| vec![]);
 
+        let network_passphrase = env::var("STELLAR_NETWORK_PASSPHRASE")
+            .unwrap_or_else(|_| match &blockchain_network {
+                BlockchainNetwork::Testnet => "Test SDF Network ; September 2015".to_string(),
+                BlockchainNetwork::Mainnet => {
+                    "Public Global Stellar Network ; September 2015".to_string()
+                }
+                BlockchainNetwork::Custom => String::new(),
+            });
+
         Self {
             bind_addr,
             redis_url: env::var("REDIS_URL")
@@ -307,6 +327,14 @@ impl Config {
                         .unwrap_or(30)
                         .max(1),
                 ),
+                statement_timeout_ms: env::var("DB_STATEMENT_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(30_000),
+                lock_timeout_ms: env::var("DB_LOCK_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(10_000),
             },
             blockchain_rpc_url,
             blockchain_network,
@@ -419,6 +447,7 @@ impl Config {
             unsubscribe_signing_secret: env::var("UNSUBSCRIBE_SIGNING_SECRET").ok(),
             cors: CorsConfig::from_env(),
             contract_key_schema: ContractKeySchema::from_env(),
+            network_passphrase,
         }
     }
 
