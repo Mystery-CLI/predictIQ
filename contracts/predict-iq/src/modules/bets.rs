@@ -112,7 +112,7 @@ pub fn place_bet(
     // Deduct protocol fee from the bet amount before crediting the pool.
     // This ensures total_staked always reflects the net distributable pool,
     // so the parimutuel formula pays out the correct proportional share.
-    let fee = crate::modules::fees::calculate_tiered_fee(e, amount, &market.tier);
+    let fee = crate::modules::fees::calculate_tiered_fee(e, amount, &market.tier)?;
     let net_amount = amount - fee;
 
     if fee > 0 {
@@ -153,7 +153,7 @@ pub fn place_bet(
     // Track referral reward — 10% of the protocol fee goes to the referrer.
     if let Some(ref r) = referrer {
         if fee > 0 {
-            crate::modules::fees::add_referral_reward(e, r, &token_address, fee);
+            crate::modules::fees::add_referral_reward(e, r, &token_address, fee)?;
         }
         // Store referrer so cancellation can reverse the reward if needed.
         let referrer_key = DataKey::BetReferrer(market_id, bettor.clone(), outcome);

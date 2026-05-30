@@ -59,21 +59,21 @@ pub fn create_market(
 
     // Issue #510: Validate market deadlines
     let current_time = e.ledger().timestamp();
-    
-    // Betting deadline must be in the future
+
+    // end_time (deadline) must be strictly greater than current ledger time
     if deadline <= current_time {
-        return Err(ErrorCode::InvalidDeadline);
+        return Err(ErrorCode::InvalidTimeRange);
     }
-    
-    // Resolution deadline must be after betting deadline
+
+    // end_time (resolution_deadline) must be strictly greater than start_time (deadline)
     if resolution_deadline <= deadline {
-        return Err(ErrorCode::InvalidDeadline);
+        return Err(ErrorCode::InvalidTimeRange);
     }
-    
+
     // Enforce minimum deadline gap (24 hours = 86400 seconds)
     const MIN_DEADLINE_GAP: u64 = 86400;
     if resolution_deadline - deadline < MIN_DEADLINE_GAP {
-        return Err(ErrorCode::InvalidDeadline);
+        return Err(ErrorCode::InvalidTimeRange);
     }
 
     // Gas optimization: Limit number of outcomes to prevent excessive iteration
