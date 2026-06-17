@@ -181,7 +181,10 @@ pub async fn send_confirmation_email(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = response.text().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to read SendGrid error response body");
+            String::new()
+        });
         anyhow::bail!("sendgrid returned {status}: {body}");
     }
 
