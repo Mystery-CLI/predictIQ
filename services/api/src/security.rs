@@ -480,7 +480,13 @@ pub async fn sendgrid_webhook_middleware(
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
 
-        // Replay protection: reject stale timestamps (> config.replay_window_secs)
+        // Replay protection: reject stale AND future-dated timestamps.
+        //
+        // The previous check used .abs() which accepted future-dated timestamps
+        // within the replay window. An attacker could pre-sign a request with
+        // timestamp = now + window - 1 and replay it for up to 2 * window seconds.
+        // The fix rejects any timestamp that is in the future at all, and any that
+        // is more than replay_window_secs old.
         let ts_str = headers
             .get("x-twilio-email-event-webhook-timestamp")
             .and_then(|h| h.to_str().ok())
@@ -490,7 +496,14 @@ pub async fn sendgrid_webhook_middleware(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        if (now - ts).abs() > config.replay_window_secs as i64 {
+        let age_secs = now - ts;
+        if age_secs < 0 || age_secs > config.replay_window_secs as i64 {
+            tracing::warn!(
+                ts,
+                now,
+                age_secs,
+                "sendgrid webhook rejected: timestamp out of bounds"
+            );
             return Err(StatusCode::UNAUTHORIZED);
         }
 
@@ -1213,6 +1226,45 @@ mod tests {
             token_timestamp,
             grace_period
         ));
+    }
+
+    // ── webhook timestamp validation tests ───────────────────────────────────
+
+    fn check_age(now: i64, ts: i64, window: u64) -> bool {
+        let age_secs = now - ts;
+        !(age_secs < 0 || age_secs > window as i64)
+    }
+
+    #[test]
+    fn webhook_timestamp_within_window_accepted() {
+        let now = 1_700_000_000i64;
+        assert!(check_age(now, now - 100, 300));
+    }
+
+    #[test]
+    fn webhook_timestamp_exactly_at_window_edge_accepted() {
+        let now = 1_700_000_000i64;
+        assert!(check_age(now, now - 300, 300));
+    }
+
+    #[test]
+    fn webhook_timestamp_beyond_window_rejected() {
+        let now = 1_700_000_000i64;
+        assert!(!check_age(now, now - 301, 300));
+    }
+
+    #[test]
+    fn webhook_future_timestamp_rejected() {
+        let now = 1_700_000_000i64;
+        assert!(!check_age(now, now + 1, 300));
+    }
+
+    #[test]
+    fn webhook_future_timestamp_within_old_window_rejected() {
+        // Under the old .abs() logic, now + 299 would have been accepted
+        // because abs(now - (now+299)) = 299 < 300. The new logic rejects it.
+        let now = 1_700_000_000i64;
+        assert!(!check_age(now, now + 299, 300));
     }
 }
 
